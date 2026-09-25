@@ -1,6 +1,5 @@
 import asyncio
 import json
-import random
 import re
 import socket
 import time
@@ -336,6 +335,15 @@ def retry(func):
             self (Minitouch):
         """
         init = None
+        local_reset_attempted = False
+
+        def reset_minitouch_connection():
+            """仅重建失效的控制连接，不主动断开整个 ADB 设备。"""
+            client = getattr(self, '_minitouch_client', None)
+            if client is not None:
+                client.close()
+            del_cached_property(self, 'minitouch_builder')
+
         for _ in range(RETRY_TRIES):
             try:
                 if callable(init):
@@ -345,18 +353,21 @@ def retry(func):
             # Can't handle
             except RequestHumanTakeover:
                 break
-            # When adb server was killed
-            except ConnectionResetError as e:
-                logger.error(e)
-
-                def init():
-                    self.adb_reconnect()
-            # Emulator closed
-            except ConnectionAbortedError as e:
-                logger.error(e)
-
-                def init():
-                    self.adb_reconnect()
+            # 长时间战斗后常见的是 minitouch socket 被关闭，并非 ADB
+            # 服务失效。首次仅重建控制连接；再次失败才升级为 ADB 重连。
+            except (ConnectionResetError, ConnectionAbortedError) as e:
+                if not local_reset_attempted:
+                    logger.warning(
+                        f'Minitouch control connection reset, rebuild locally: '
+                        f'{e}'
+                    )
+                    local_reset_attempted = True
+                    init = reset_minitouch_connection
+                else:
+                    logger.error(e)
+                    def init():
+                        self.adb_reconnect()
+                        reset_minitouch_connection()
             # MinitouchNotInstalledError: Received empty data from minitouch
             except MinitouchNotInstalledError as e:
                 logger.error(e)
@@ -384,9 +395,7 @@ def retry(func):
                     break
             except BrokenPipeError as e:
                 logger.error(e)
-
-                def init():
-                    del_cached_property(self, 'minitouch_builder')
+                init = reset_minitouch_connection
             # Unknown, probably a trucked image
             except Exception as e:
                 logger.exception(e)
@@ -407,14 +416,6 @@ class Minitouch(Connection):
     _minitouch_ws: websockets.WebSocketClientProtocol
     max_x: int
     max_y: int
-    max_pressure: int = 100
-
-    def _humanized_pressure(self) -> int:
-        top = getattr(self, 'max_pressure', 100) or 100
-        return random.randint(max(20, top // 2), top)
-
-    def _humanized_dwell(self) -> int:
-        return int(random.triangular(45, 130, 65))
 
     @cached_property
     def minitouch_builder(self):
@@ -477,10 +478,7 @@ class Minitouch(Connection):
         # self.max_contacts = max_contacts
         self.max_x = int(max_x)
         self.max_y = int(max_y)
-        try:
-            self.max_pressure = int(max_pressure)
-        except (ValueError, TypeError):
-            self.max_pressure = 100
+        # self.max_pressure = max_pressure
 
         # $ <pid>
         out = socket_out.readline().replace("\n", "").replace("\r", "")
@@ -581,10 +579,7 @@ class Minitouch(Connection):
     @retry
     def click_minitouch(self, x, y):
         builder = self.minitouch_builder
-        pressure = self._humanized_pressure()
-        builder.down(x, y, pressure=pressure).commit().wait(self._humanized_dwell())
-        mx, my = x + random.randint(-2, 2), y + random.randint(-2, 2)
-        builder.move(mx, my, pressure=pressure).commit().wait(random.randint(8, 20))
+        builder.down(x, y).commit()
         builder.up().commit()
         self.minitouch_send()
 
@@ -592,7 +587,7 @@ class Minitouch(Connection):
     def long_click_minitouch(self, x, y, duration=1.0):
         duration = int(duration * 1000)
         builder = self.minitouch_builder
-        builder.down(x, y, pressure=self._humanized_pressure()).commit().wait(duration)
+        builder.down(x, y).commit().wait(duration)
         builder.up().commit()
         self.minitouch_send()
 
@@ -605,7 +600,7 @@ class Minitouch(Connection):
         self.minitouch_send()
 
         for point in points[1:]:
-            builder.move(*point).commit().wait(random.randint(6, 15))
+            builder.move(*point).commit().wait(10)
         self.minitouch_send()
 
         builder.up().commit()
@@ -622,7 +617,7 @@ class Minitouch(Connection):
         self.minitouch_send()
 
         for point in points[1:]:
-            builder.move(*point).commit().wait(random.randint(6, 15))
+            builder.move(*point).commit().wait(10)
         self.minitouch_send()
 
         builder.move(*p2).commit().wait(140)
