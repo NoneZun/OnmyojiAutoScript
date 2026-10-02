@@ -4,6 +4,54 @@
 import sys
 import os
 
+# --- DLL 预加载（必须在 import PySide6 之前执行）-----------------------------
+# 背景：module/gui/FluentUI/fluentuiplugin.dll 依赖 fluentui.dll（在 <项目根>/toolkit）
+# 以及 Qt6Core/Qt6Qml/Qt6Quick/Qt6Gui（在 PySide6 目录）。
+#
+# 坑：Qt 加载 QML 插件时**只按 PATH 环境变量**搜索依赖，Python 的
+#     os.add_dll_directory() 对它无效（实测对比过：只加 PATH 成功，只加
+#     add_dll_directory 失败）。所以从 IDE 或任意终端直接跑 gui.py 时，如果 PATH
+#     里没有那两个目录，就会报：
+#         无法加载库 ...\fluentuiplugin.dll：找不到指定的模块。
+#
+# 解法：在导入 Qt 之前用 ctypes 把这些 DLL 预加载进进程，之后 Qt 加载插件时
+#       依赖已在内存里，不再依赖 PATH。实测在 PATH 被清空的情况下依然可用。
+def _preload_qt_dlls():
+    try:
+        import ctypes
+    except Exception:  # noqa: BLE001
+        return
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    candidates = []
+    try:
+        import PySide6
+        candidates.append(os.path.dirname(PySide6.__file__))
+    except Exception:  # noqa: BLE001
+        pass
+    candidates.append(os.path.join(repo_root, 'toolkit'))
+
+    for d in candidates:
+        if not os.path.isdir(d):
+            continue
+        # 同时写 PATH 兜底（对某些 Qt 版本仍有帮助）
+        os.environ['PATH'] = d + os.pathsep + os.environ.get('PATH', '')
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for name in names:
+            if not name.lower().endswith('.dll'):
+                continue
+            try:
+                ctypes.WinDLL(os.path.join(d, name))
+            except OSError:
+                pass  # 个别 DLL 加载不了不影响，Qt 会自己再试
+
+
+_preload_qt_dlls()
+# --------------------------------------------------------------------------
+
 from PySide6.QtGui import QGuiApplication, QIcon
 from PySide6.QtQml import QQmlApplicationEngine, qmlRegisterType
 from PySide6.QtCore import Qt, QObject, QTranslator, QLocale, Slot
